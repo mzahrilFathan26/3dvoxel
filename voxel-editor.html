@@ -1,0 +1,342 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Voxel Editor + Hand Control (Prototype)</title>
+<style>
+  html,body { height:100%; margin:0; font-family: Arial; background:#111; color:#eee; }
+  #app { display:flex; height:100vh; gap:8px; padding:8px; box-sizing:border-box; }
+  #stage { flex:1; background:#000; border-radius:8px; overflow:hidden; position:relative; }
+  #ui { width:360px; min-width:260px; background:rgba(20,20,20,0.95); border-radius:8px; padding:12px; box-sizing:border-box; }
+  button{display:inline-block;margin:6px 6px 6px 0;padding:8px 12px;border-radius:6px;border:0;background:#2b2b2b;color:#fff;cursor:pointer;}
+  .small { font-size:0.85rem;padding:6px 8px; }
+  label{display:block;margin-top:8px;font-size:0.9rem}
+  #camPreview{position:absolute; right:8px; top:8px; width:200px; height:140px; border:2px solid rgba(255,255,255,0.08); border-radius:6px; overflow:hidden; opacity:0.9; background:#222;}
+  #status { margin-top:8px; font-size:0.85rem; color:#ccc }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="stage">
+    <div id="camPreview"><video id="video" autoplay playsinline style="width:100%;height:100%;object-fit:cover;"></video></div>
+  </div>
+  <div id="ui">
+    <h3>Voxel Editor (Web prototype)</h3>
+    <div>
+      <button id="reset">Reset Grid</button>
+      <button id="toggleCam">Toggle Cam</button>
+      <button id="savePng">Save PNG</button>
+      <button id="exportJson">Export JSON</button>
+    </div>
+    <label>Grid size: <span id="gridLabel">16</span></label>
+    <input id="gridSize" type="range" min="8" max="32" value="16" />
+    <label>Voxel size: <span id="voxelLabel">0.9</span></label>
+    <input id="voxelSize" type="range" min="0.4" max="2" step="0.1" value="0.9" />
+    <div id="status">Status: Menunggu kamera...</div>
+    <hr />
+    <p>
+      Kontrol tangan:
+      <ul>
+        <li>Gerakkan jari telunjuk untuk menggerakkan kursor voxel (video kanan atas)</li>
+        <li>Pinch (jempol+telunjuk mendekat) untuk <b>menambah</b> voxel</li>
+        <li>Buka tangan untuk <b>menghapus</b> voxel</li>
+        <li>Gunakan mouse untuk mengorbit / zoom</li>
+      </ul>
+    </p>
+    <div style="margin-top:12px;font-size:0.8rem;color:#aaa">
+      Prototype — untuk produksi butuh penyempurnaan kalibrasi, smoothing, dan handling lighting/performance.
+    </div>
+  </div>
+</div>
+
+<!-- three.js -->
+<script src="https://unpkg.com/three@0.159.0/build/three.min.js"></script>
+<script src="https://unpkg.com/three@0.159.0/examples/js/controls/OrbitControls.js"></script>
+
+<!-- MediaPipe Hands -->
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+
+<script>
+(async function(){
+
+// ---------- UI refs ----------
+const canvasContainer = document.getElementById('stage');
+const videoElement = document.getElementById('video');
+const statusEl = document.getElementById('status');
+const gridSizeInput = document.getElementById('gridSize');
+const voxelSizeInput = document.getElementById('voxelSize');
+const gridLabel = document.getElementById('gridLabel');
+const voxelLabel = document.getElementById('voxelLabel');
+
+gridLabel.textContent = gridSizeInput.value;
+voxelLabel.textContent = voxelSizeInput.value;
+
+document.getElementById('gridSize').addEventListener('input', e=> {
+  gridLabel.textContent = e.target.value;
+});
+document.getElementById('voxelSize').addEventListener('input', e=> {
+  voxelLabel.textContent = e.target.value;
+});
+
+// ---------- three.js scene ----------
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x111111);
+
+const renderer = new THREE.WebGLRenderer({antialias:true});
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setSize(canvasContainer.clientWidth, canvasContainer.clientHeight);
+canvasContainer.appendChild(renderer.domElement);
+
+window.addEventListener('resize', ()=>{
+  renderer.setSize(canvasContainer.clientWidth, canvasContainer.clientHeight);
+  camera.aspect = canvasContainer.clientWidth / canvasContainer.clientHeight;
+  camera.updateProjectionMatrix();
+});
+
+const camera = new THREE.PerspectiveCamera(45, canvasContainer.clientWidth / canvasContainer.clientHeight, 0.1, 1000);
+camera.position.set(25,25,25);
+
+const controls = new THREE.OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.target.set(0,0,0);
+
+// lights
+const dir = new THREE.DirectionalLight(0xffffff, 0.9);
+dir.position.set(10,20,10);
+scene.add(dir);
+scene.add(new THREE.AmbientLight(0x666666));
+
+// grid helper
+let gridHelper = new THREE.GridHelper(32, 32, 0x333333, 0x222222);
+scene.add(gridHelper);
+
+// voxel instanced mesh container and data
+let voxelSize = parseFloat(voxelSizeInput.value);
+let gridN = parseInt(gridSizeInput.value);
+let voxelMesh, voxelData; // voxelData: map of coords -> color index
+let cursorBox;
+
+function initVoxels(n, vs) {
+  gridN = n;
+  voxelSize = vs;
+  // remove old
+  if (voxelMesh) scene.remove(voxelMesh);
+  if (cursorBox) scene.remove(cursorBox);
+
+  // geometry for a unit cube
+  const geom = new THREE.BoxGeometry(voxelSize, voxelSize, voxelSize);
+  const mat = new THREE.MeshStandardMaterial({color:0xffb000});
+
+  // We'll not pre-instantiate many instances; instead maintain map and individual meshes for simplicity
+  voxelData = {}; // key "x,y,z" => color hex
+  // create cursor box
+  const cursorGeom = new THREE.BoxGeometry(voxelSize*1.02, voxelSize*1.02, voxelSize*1.02);
+  const cursorMat = new THREE.MeshBasicMaterial({color:0x00ffcc, wireframe:true, transparent:true, opacity:0.9});
+  cursorBox = new THREE.Mesh(cursorGeom, cursorMat);
+  scene.add(cursorBox);
+  cursorBox.visible = false;
+
+  // reposition grid helper and camera
+  gridHelper.scale.set(n/16,1,n/16);
+  gridHelper.position.set(0,0,0);
+  controls.target.set(0,0,0);
+}
+
+initVoxels(gridN, voxelSize);
+
+// helper: add voxel at integer grid coords (centered at origin)
+function addVoxel(x,y,z, color=0xff7744) {
+  const key = `${x},${y},${z}`;
+  if (voxelData[key]) return; // already exists
+  const geom = new THREE.BoxGeometry(voxelSize, voxelSize, voxelSize);
+  const mat = new THREE.MeshStandardMaterial({color});
+  const m = new THREE.Mesh(geom, mat);
+  m.position.set(x,y,z);
+  m.userData.voxelKey = key;
+  scene.add(m);
+  voxelData[key] = {color, mesh: m};
+}
+
+function removeVoxel(x,y,z) {
+  const key = `${x},${y},${z}`;
+  const entry = voxelData[key];
+  if (!entry) return;
+  scene.remove(entry.mesh);
+  delete voxelData[key];
+}
+
+// map screen coords (0..1) to grid coords
+function screenToGrid(u, v) {
+  // u: 0..1 left->right, v:0..1 top->bottom
+  // map to -half .. +half range
+  const half = (gridN-1)/2;
+  const gx = Math.round( (u* (gridN-1)) - half );
+  const gy = Math.round( ((1-v) * (gridN-1)) - half ); // invert y so up is positive
+  // fixed z for now as 0 plane or use depth estimation?
+  const gz = 0; // center layer
+  return [gx, gy, gz];
+}
+
+// We'll attempt a simple depth: use z based on distance between index finger and wrist
+function screenToGridWithDepth(u,v, depthNormalized) {
+  const half = (gridN-1)/2;
+  const gx = Math.round( (u* (gridN-1)) - half );
+  const gy = Math.round( ((1-v) * (gridN-1)) - half );
+  // depthNormalized 0..1 maps to -half..half
+  const gz = Math.round( (depthNormalized* (gridN-1)) - half );
+  return [gx, gy, gz];
+}
+
+// ---------- MediaPipe Hands setup ----------
+let camEnabled = true;
+const hands = new Hands({locateFile: (file) => {
+  return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+}});
+hands.setOptions({
+  modelComplexity: 0,
+  maxNumHands: 1,
+  minDetectionConfidence: 0.6,
+  minTrackingConfidence: 0.5
+});
+
+hands.onResults(onHandsResult);
+
+const cameraUtils = new Camera(videoElement, {
+  onFrame: async () => {
+    if (camEnabled) await hands.send({image: videoElement});
+  },
+  width: 640,
+  height: 480
+});
+
+async function startCamera(){
+  try {
+    await cameraUtils.start();
+    statusEl.textContent = 'Status: Kamera aktif, menunggu tangan...';
+  } catch(e){
+    console.error(e);
+    statusEl.textContent = 'Status: Gagal mengakses kamera: ' + e.message;
+  }
+}
+startCamera();
+
+document.getElementById('toggleCam').addEventListener('click', ()=>{
+  camEnabled = !camEnabled;
+  statusEl.textContent = camEnabled ? 'Status: Kamera diaktifkan' : 'Status: Kamera dimatikan';
+});
+
+// track last pinch state to debounce actions
+let lastPinch = false;
+let lastActionTime = 0;
+
+function onHandsResult(result) {
+  if (!result.multiHandLandmarks || result.multiHandLandmarks.length === 0) {
+    cursorBox.visible = false;
+    statusEl.textContent = 'Status: Tidak ada tangan terdeteksi';
+    return;
+  }
+  const landmarks = result.multiHandLandmarks[0];
+  // landmark indices: 4 = thumb tip, 8 = index tip, 0 = wrist
+  const thumb = landmarks[4];
+  const indexTip = landmarks[8];
+  const wrist = landmarks[0];
+
+  // compute 2D screen coords from webcam feed (videoElement) - normalized 0..1
+  // MediaPipe coords: x,y in [0..1] relative to video width/height, y origin top
+  const u = indexTip.x; // left 0 -> right 1
+  const v = indexTip.y;
+
+  // depth proxy: distance from wrist to index in z (landmarks have z negative toward camera)
+  // normalize roughly
+  const depthProxy = Math.max(0, Math.min(1, (Math.abs(indexTip.z - wrist.z)) * 10)); // heuristic
+  const [gx, gy, gz] = screenToGridWithDepth(u, v, depthProxy);
+
+  // move cursor to grid cell center
+  cursorBox.visible = true;
+  cursorBox.position.set(gx, gy, gz);
+
+  // detect pinch: distance in 3D between thumb tip and index tip
+  const dx = thumb.x - indexTip.x;
+  const dy = thumb.y - indexTip.y;
+  const dz = thumb.z - indexTip.z;
+  const dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
+
+  const pinchThreshold = 0.035; // smaller -> require closer pinch (may need tuning)
+  const isPinch = dist < pinchThreshold;
+
+  // debounced add/remove
+  const now = performance.now();
+  if (isPinch && !lastPinch && (now - lastActionTime) > 300) {
+    // pinch start -> add voxel at cursor
+    addVoxel(gx, gy, gz, 0xffaa00);
+    lastActionTime = now;
+  } else if (!isPinch && lastPinch && (now - lastActionTime) > 300) {
+    // pinch release -> remove voxel (if release indicates intent); here we choose remove on open hand
+    removeVoxel(gx, gy, gz);
+    lastActionTime = now;
+  }
+
+  lastPinch = isPinch;
+  statusEl.textContent = `Status: Tangan terdeteksi — grid(${gx},${gy},${gz}) — ${isPinch? 'PINCH':'OPEN'}`;
+}
+
+// ---------- render loop ----------
+function animate(){
+  requestAnimationFrame(animate);
+  controls.update();
+  renderer.render(scene, camera);
+}
+animate();
+
+// ---------- UI buttons ----------
+document.getElementById('reset').addEventListener('click', ()=>{
+  // remove all voxel meshes
+  for (let k in voxelData) {
+    scene.remove(voxelData[k].mesh);
+  }
+  voxelData = {};
+});
+
+document.getElementById('savePng').addEventListener('click', ()=>{
+  renderer.domElement.toBlob(function(blob){
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'voxel_canvas.png';
+    a.click();
+    URL.revokeObjectURL(url);
+  });
+});
+
+document.getElementById('exportJson').addEventListener('click', ()=>{
+  // produce JSON with grid size and list of voxels
+  const voxels = [];
+  for (const k in voxelData) {
+    const [x,y,z] = k.split(',').map(Number);
+    voxels.push({x,y,z,color: voxelData[k].color});
+  }
+  const payload = {gridN, voxelSize, voxels};
+  const blob = new Blob([JSON.stringify(payload, null, 2)], {type:'application/json'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'voxels_export.json';
+  a.click();
+  URL.revokeObjectURL(url);
+});
+
+gridSizeInput.addEventListener('change', ()=> {
+  const n = parseInt(gridSizeInput.value);
+  initVoxels(n, parseFloat(voxelSizeInput.value));
+});
+
+voxelSizeInput.addEventListener('change', ()=> {
+  initVoxels(parseInt(gridSizeInput.value), parseFloat(voxelSizeInput.value));
+});
+
+})();
+</script>
+</body>
+</html>
